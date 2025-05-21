@@ -1,9 +1,11 @@
 import json
+import os
 from xml.etree.ElementTree import Element, SubElement, tostring
 import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 from datetime import datetime
+import uuid
 
 # Configure logging
 logging.basicConfig(
@@ -13,11 +15,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# TurboRater API Integration (Mocked)
+# TurboRater API Simulation
 class TurboRaterIntegration:
-    def __init__(self, api_url, username, password):
-        self.api_url = api_url
-        self.auth = (username, password)
+    def __init__(self, storage_file='quotes.json'):
+        self.storage_file = storage_file
+        # Initialize storage file if it doesn't exist
+        if not os.path.exists(self.storage_file):
+            with open(self.storage_file, 'w') as f:
+                json.dump({}, f)
 
     def convert_to_acord_xml(self, quote_data):
         root = Element("ACORD", xmlns="http://www.acord.org/standards")
@@ -47,18 +52,30 @@ class TurboRaterIntegration:
         
         return tostring(root, encoding="unicode", method="xml")
 
-    def send_to_turborater(self, quote_data):
+    def store_quote(self, quote_data):
         xml_data = self.convert_to_acord_xml(quote_data)
-        logger.info(f"Generated ACORD XML: {xml_data}")
+        quote_id = str(uuid.uuid4())
         
-        # Mock TurboRater API response (bypassing actual API call)
-        mock_response = {
-            "status": "success",
-            "quote_id": "TR123456789",
-            "message": "Quote stored successfully"
-        }
-        logger.info(f"Mock TurboRater API response: {mock_response}")
-        return mock_response
+        # Store quote in JSON file
+        try:
+            with open(self.storage_file, 'r+') as f:
+                quotes = json.load(f)
+                quotes[quote_id] = {
+                    "xml": xml_data,
+                    "timestamp": datetime.now().isoformat(),
+                    "quote_data": quote_data
+                }
+                f.seek(0)
+                json.dump(quotes, f, indent=2)
+            logger.info(f"Stored quote {quote_id}: {xml_data}")
+            return {
+                "status": "success",
+                "quote_id": quote_id,
+                "message": "Quote stored successfully"
+            }
+        except Exception as e:
+            logger.error(f"Failed to store quote: {str(e)}")
+            return None
 
 # HTTP Server for QuotePro data
 class QuoteProHandler(BaseHTTPRequestHandler):
@@ -67,46 +84,52 @@ class QuoteProHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def do_POST(self):
-        try:
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length).decode('utf-8')
-            quote_data = json.loads(post_data)
-            
-            # Conditional trigger for online quotes
-            if quote_data.get("source") == "online":
-                result = self.turborater_integration.send_to_turborater(quote_data)
-                if result:
+        if self.path == '/quote':
+            try:
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length).decode('utf-8')
+                quote_data = json.loads(post_data)
+                
+                # Conditional trigger for online quotes
+                if quote_data.get("source") == "online":
+                    result = self.turborater_integration.store_quote(quote_data)
+                    if result:
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "success", "data": result}).encode())
+                    else:
+                        self.send_response(500)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": "Failed to store quote"}).encode())
+                else:
                     self.send_response(200)
                     self.send_header('Content-type', 'application/json')
                     self.end_headers()
-                    self.wfile.write(json.dumps({"status": "success", "data": result}).encode())
-                else:
-                    self.send_response(500)
-                    self.send_header('Content-type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "Failed to send to TurboRater"}).encode())
-            else:
-                self.send_response(200)
+                    self.wfile.write(json.dumps({"status": "ignored", "reason": "Not an online quote"}).encode())
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON: {str(e)}")
+                self.send_response(400)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
-                self.wfile.write(json.dumps({"status": "ignored", "reason": "Not an online quote"}).encode())
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON: {str(e)}")
-            self.send_response(400)
+                self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
+            except Exception as e:
+                logger.error(f"Server error: {str(e)}")
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Internal server error"}).encode())
+        else:
+            self.send_response(404)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
-        except Exception as e:
-            logger.error(f"Server error: {str(e)}")
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "Internal server error"}).encode())
+            self.wfile.write(json.dumps({"error": "Endpoint not found"}).encode())
 
 # Microservice
 class QuoteProToTurboRaterService:
-    def __init__(self, turborater_api_url, turborater_username, turborater_password, host='localhost', port=8000):
-        self.turborater_integration = TurboRaterIntegration(turborater_api_url, turborater_username, turborater_password)
+    def __init__(self, host='0.0.0.0', port=int(os.getenv('PORT', 8000))):
+        self.turborater_integration = TurboRaterIntegration()
         self.host = host
         self.port = port
 
@@ -120,11 +143,7 @@ class QuoteProToTurboRaterService:
 
 # Test function with sample data
 def run_tests():
-    turborater = TurboRaterIntegration(
-        "https://api.turborater.com/quote",  # Placeholder (not used in mock)
-        "username",                          # Placeholder (not used in mock)
-        "password"                           # Placeholder (not used in mock)
-    )
+    turborater = TurboRaterIntegration()
     
     # Sample QuotePro data for an auto insurance quote
     sample_quote = {
@@ -144,17 +163,17 @@ def run_tests():
     }
     
     # Test with sample data
-    result = turborater.send_to_turborater(sample_quote)
+    result = turborater.store_quote(sample_quote)
     logger.info(f"Sample data test result: {result}")
     
     # Test with invalid data
     invalid_quote = {"invalid": "data"}
-    result = turborater.send_to_turborater(invalid_quote)
+    result = turborater.store_quote(invalid_quote)
     logger.info(f"Invalid data test result: {result}")
     
     # Test with incomplete data
     incomplete_quote = {"last_name": "Smith", "source": "online"}
-    result = turborater.send_to_turborater(incomplete_quote)
+    result = turborater.store_quote(incomplete_quote)
     logger.info(f"Incomplete data test result: {result}")
     
     # Test with in-office quote (should be ignored)
@@ -167,30 +186,11 @@ def run_tests():
         "quote_amount": 2000.00,
         "policy_type": "auto"
     }
-    result = turborater.send_to_turborater(inoffice_quote)
+    result = turborater.store_quote(inoffice_quote)
     logger.info(f"In-office data test result: {result}")
 
 # Example usage
 if __name__ == "__main__":
-    service = QuoteProToTurboRaterService(
-        turborater_api_url="https://api.turborater.com/quote",
-        turborater_username="username",
-        turborater_password="password",
-        host="localhost",
-        port=8000
-    )
-    
-    # Run tests
+    service = QuoteProToTurboRaterService()
     run_tests()
-    
-    # Start server in a separate thread
-    server_thread = threading.Thread(target=service.start_server)
-    server_thread.daemon = True
-    server_thread.start()
-    
-    # Keep main thread running
-    try:
-        while True:
-            pass
-    except KeyboardInterrupt:
-        logger.info(f"Shutting down server at {datetime.now()}")
+    service.start_server()
