@@ -2,195 +2,97 @@ import json
 import os
 from xml.etree.ElementTree import Element, SubElement, tostring
 import logging
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
-from datetime import datetime
 import uuid
+from datetime import datetime
+from urllib.parse import parse_qs
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    filename='turborater_integration.log',
+    filename='/home/ubuntu/turborater_integration.log',
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# TurboRater API Simulation
 class TurboRaterIntegration:
-    def __init__(self, storage_file='quotes.json'):
-        self.storage_file = storage_file
-        # Initialize storage file if it doesn't exist
-        if not os.path.exists(self.storage_file):
-            with open(self.storage_file, 'w') as f:
-                json.dump({}, f)
+    def __init__(self):
+        self.quotes = {}
 
     def convert_to_acord_xml(self, quote_data):
         root = Element("ACORD", xmlns="http://www.acord.org/standards")
         insurance = SubElement(root, "InsuranceSvcRq")
         quote = SubElement(insurance, "QuoteRq")
-        
-        # Insured details
         insured = SubElement(quote, "Insured")
-        SubElement(insured, "Name").text = quote_data.get("last_name", "Unknown")
-        SubElement(insured, "FirstName").text = quote_data.get("first_name", "")
-        SubElement(insured, "Email").text = quote_data.get("email", "")
-        SubElement(insured, "Phone").text = quote_data.get("phone", "")
-        
-        # Policy details
+        location = quote_data.get("location", {})
+        SubElement(insured, "Name").text = location.get("lastName", "Unknown")
+        SubElement(insured, "FirstName").text = location.get("firstName", "")
+        SubElement(insured, "Email").text = location.get("email", "")
+        SubElement(insured, "Phone").text = location.get("phone", "")
         policy = SubElement(quote, "Policy")
-        SubElement(policy, "PolicyType").text = quote_data.get("policy_type", "auto")
-        SubElement(policy, "QuoteAmount").text = str(quote_data.get("quote_amount", 0))
-        SubElement(policy, "Source").text = quote_data.get("source", "online")
-        
-        # Vehicle details (if provided)
-        if "vehicle" in quote_data:
+        quote_info = quote_data.get("quote", {})
+        SubElement(policy, "PolicyType").text = "auto"
+        SubElement(policy, "QuoteAmount").text = str(quote_info.get("totalAmount", 0))
+        SubElement(policy, "Source").text = "online"
+        vehicles = quote_data.get("vehicles", [])
+        if vehicles:
             vehicle = SubElement(quote, "Vehicle")
-            SubElement(vehicle, "VIN").text = quote_data["vehicle"].get("vin", "")
-            SubElement(vehicle, "Make").text = quote_data["vehicle"].get("make", "")
-            SubElement(vehicle, "Model").text = quote_data["vehicle"].get("model", "")
-            SubElement(vehicle, "Year").text = str(quote_data["vehicle"].get("year", ""))
-        
+            v = vehicles[0]
+            SubElement(vehicle, "VIN").text = v.get("vinNumber", "")
+            SubElement(vehicle, "Make").text = v.get("makeDescription", "")
+            SubElement(vehicle, "Model").text = v.get("modelDescription", "")
+            SubElement(vehicle, "Year").text = v.get("year", "")
         return tostring(root, encoding="unicode", method="xml")
 
     def store_quote(self, quote_data):
         xml_data = self.convert_to_acord_xml(quote_data)
         quote_id = str(uuid.uuid4())
-        
-        # Store quote in JSON file
-        try:
-            with open(self.storage_file, 'r+') as f:
-                quotes = json.load(f)
-                quotes[quote_id] = {
-                    "xml": xml_data,
-                    "timestamp": datetime.now().isoformat(),
-                    "quote_data": quote_data
-                }
-                f.seek(0)
-                json.dump(quotes, f, indent=2)
-            logger.info(f"Stored quote {quote_id}: {xml_data}")
-            return {
-                "status": "success",
-                "quote_id": quote_id,
-                "message": "Quote stored successfully"
-            }
-        except Exception as e:
-            logger.error(f"Failed to store quote: {str(e)}")
-            return None
-
-# HTTP Server for QuotePro data
-class QuoteProHandler(BaseHTTPRequestHandler):
-    def __init__(self, turborater_integration, *args, **kwargs):
-        self.turborater_integration = turborater_integration
-        super().__init__(*args, **kwargs)
-
-    def do_POST(self):
-        if self.path == '/quote':
-            try:
-                content_length = int(self.headers['Content-Length'])
-                post_data = self.rfile.read(content_length).decode('utf-8')
-                quote_data = json.loads(post_data)
-                
-                # Conditional trigger for online quotes
-                if quote_data.get("source") == "online":
-                    result = self.turborater_integration.store_quote(quote_data)
-                    if result:
-                        self.send_response(200)
-                        self.send_header('Content-type', 'application/json')
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"status": "success", "data": result}).encode())
-                    else:
-                        self.send_response(500)
-                        self.send_header('Content-type', 'application/json')
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"error": "Failed to store quote"}).encode())
-                else:
-                    self.send_response(200)
-                    self.send_header('Content-type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"status": "ignored", "reason": "Not an online quote"}).encode())
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON: {str(e)}")
-                self.send_response(400)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
-            except Exception as e:
-                logger.error(f"Server error: {str(e)}")
-                self.send_response(500)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": "Internal server error"}).encode())
-        else:
-            self.send_response(404)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "Endpoint not found"}).encode())
-
-# Microservice
-class QuoteProToTurboRaterService:
-    def __init__(self, host='0.0.0.0', port=int(os.getenv('PORT', 8000))):
-        self.turborater_integration = TurboRaterIntegration()
-        self.host = host
-        self.port = port
-
-    def start_server(self):
-        def handler(*args, **kwargs):
-            QuoteProHandler(self.turborater_integration, *args, **kwargs)
-        
-        server = HTTPServer((self.host, self.port), handler)
-        logger.info(f"Server started on {self.host}:{self.port} at {datetime.now()}")
-        server.serve_forever()
-
-# Test function with sample data
-def run_tests():
-    turborater = TurboRaterIntegration()
-    
-    # Sample QuotePro data for an auto insurance quote
-    sample_quote = {
-        "first_name": "John",
-        "last_name": "Doe",
-        "email": "john.doe@example.com",
-        "phone": "123-456-7890",
-        "source": "online",
-        "quote_amount": 1500.00,
-        "policy_type": "auto",
-        "vehicle": {
-            "vin": "1HGCM82633A004352",
-            "make": "Honda",
-            "model": "Accord",
-            "year": 2020
+        self.quotes[quote_id] = {
+            "xml": xml_data,
+            "timestamp": datetime.now().isoformat(),
+            "quote_data": quote_data
         }
-    }
-    
-    # Test with sample data
-    result = turborater.store_quote(sample_quote)
-    logger.info(f"Sample data test result: {result}")
-    
-    # Test with invalid data
-    invalid_quote = {"invalid": "data"}
-    result = turborater.store_quote(invalid_quote)
-    logger.info(f"Invalid data test result: {result}")
-    
-    # Test with incomplete data
-    incomplete_quote = {"last_name": "Smith", "source": "online"}
-    result = turborater.store_quote(incomplete_quote)
-    logger.info(f"Incomplete data test result: {result}")
-    
-    # Test with in-office quote (should be ignored)
-    inoffice_quote = {
-        "first_name": "Jane",
-        "last_name": "Smith",
-        "email": "jane.smith@example.com",
-        "phone": "987-654-3210",
-        "source": "in-office",
-        "quote_amount": 2000.00,
-        "policy_type": "auto"
-    }
-    result = turborater.store_quote(inoffice_quote)
-    logger.info(f"In-office data test result: {result}")
+        logger.info(f"Stored quote {quote_id}: {xml_data}")
+        return {
+    "status": "success",
+    "quote_id": quote_id,
+    "xml": xml_data,  # This shows the ACORD XML as a string
+    "message": "Quote stored successfully"
+}
 
-# Example usage
-if __name__ == "__main__":
-    service = QuoteProToTurboRaterService()
-    run_tests()
-    service.start_server()
+
+def application(environ, start_response):
+    turborater = TurboRaterIntegration()
+    if environ['PATH_INFO'] == '/quote' and environ['REQUEST_METHOD'] == 'POST':
+        try:
+            content_length = int(environ.get('CONTENT_LENGTH', 0))
+            post_data = environ['wsgi.input'].read(content_length).decode('utf-8')
+            logger.info(f"Raw POST data: {post_data}")
+            parsed_data = parse_qs(post_data)
+            jsonobj = parsed_data.get('jsonobj', [''])[0]
+            quote_data = json.loads(jsonobj)
+            logger.info(f"Parsed quote data: {json.dumps(quote_data, indent=2)}")
+            if quote_data.get("location", {}).get("source", "online") == "online":
+                result = turborater.store_quote(quote_data)
+                if result:
+                    status = '200 OK'
+                    response = json.dumps({"status": "success", "data": result})
+                else:
+                    status = '500 Internal Server Error'
+                    response = json.dumps({"error": "Failed to store quote"})
+            else:
+                status = '200 OK'
+                response = json.dumps({"status": "ignored", "reason": "Not an online quote"})
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON: {str(e)}")
+            status = '400 Bad Request'
+            response = json.dumps({"error": "Invalid JSON"})
+        except Exception as e:
+            logger.error(f"Server error: {str(e)}")
+            status = '500 Internal Server Error'
+            response = json.dumps({"error": "Internal server error"})
+    else:
+        status = '404 Not Found'
+        response = json.dumps({"error": "Endpoint not found"})
+    
+    response_headers = [('Content-type', 'application/json')]
+    start_response(status, response_headers)
+    return [response.encode()]
